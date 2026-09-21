@@ -1,4 +1,7 @@
+import argparse
+import csv
 import json
+from datetime import date, timedelta
 from pathlib import Path
 
 import requests
@@ -8,14 +11,12 @@ import requests
 # 設定
 # ============================================================
 
-# 要抓哪一天
-TARGET_DATE = "2026-09-14"
-
 # CPBL API
 BASE_URL = "https://stats.cpbl.com.tw/api/proxy/v1"
 
 # 原始資料儲存位置
 OUTPUT_DIR = Path("data/raw/games")
+CSV_OUTPUT = Path("data/processed/trackman.csv")
 
 
 # ============================================================
@@ -872,142 +873,160 @@ def analyze_game(data, game_id):
 
 
 # ============================================================
+# JSON -> CSV
+# ============================================================
+
+def get_value(data, *keys):
+    current = data
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def convert_game(data):
+    game = get_value(data, "Data", "Game") or {}
+    visiting = game.get("Visiting") or {}
+    home = game.get("Home") or {}
+    rows = []
+
+    for log in game.get("LiveLog") or []:
+        if not isinstance(log, dict) or not log.get("Trackman"):
+            continue
+
+        trackman = log["Trackman"]
+        pitch_tag = get_value(trackman, "Play", "PitchTag") or {}
+        release = get_value(trackman, "Pitch", "Release") or {}
+        location = get_value(trackman, "Pitch", "Location") or {}
+        launch = get_value(trackman, "Hit", "Launch") or {}
+        landing = get_value(trackman, "Hit", "LandingFlat") or {}
+
+        rows.append({
+            "GameId": game.get("GameId"),
+            "GameSno": game.get("GameSno"),
+            "GameDate": game.get("PreExeDate"),
+            "VisitingTeam": get_value(visiting, "Team", "Name"),
+            "HomeTeam": get_value(home, "Team", "Name"),
+            "Field": get_value(game, "Field", "Abbe"),
+            "Year": log.get("Year"),
+            "Inning": log.get("InningSeq"),
+            "PitchCnt": log.get("PitchCnt"),
+            "OutCnt": log.get("OutCnt"),
+            "BallCnt": log.get("BallCnt"),
+            "StrikeCnt": log.get("StrikeCnt"),
+            "IsBall": log.get("IsBall"),
+            "IsStrike": log.get("IsStrike"),
+            "PitcherAcnt": log.get("PitcherAcnt"),
+            "PitcherName": log.get("PitcherName"),
+            "HitterAcnt": log.get("HitterAcnt"),
+            "HitterName": log.get("HitterName"),
+            "CatcherAcnt": log.get("CatcherAcnt"),
+            "CatcherName": log.get("CatcherName"),
+            "PitcherUniformNo": log.get("PitcherUniformNo"),
+            "HitterUniformNo": log.get("HitterUniformNo"),
+            "Content": log.get("Content"),
+            "ActionName": log.get("ActionName"),
+            "BattingActionName": log.get("BattingActionName"),
+            "MainEventNo": log.get("MainEventNo"),
+            "PitchCall": pitch_tag.get("PitchCall"),
+            "AutoPitchType": pitch_tag.get("AutoPitchType"),
+            "TaggedPitchType": pitch_tag.get("TaggedPitchType"),
+            "RelSide": release.get("RelSide"),
+            "RelSpeed": release.get("RelSpeed"),
+            "SpinRate": release.get("SpinRate"),
+            "Extension": release.get("Extension"),
+            "RelHeight": release.get("RelHeight"),
+            "ZoneTime": location.get("ZoneTime"),
+            "ZoneSpeed": location.get("ZoneSpeed"),
+            "PlateLocSide": location.get("PlateLocSide"),
+            "PlateLocHeight": location.get("PlateLocHeight"),
+            "ExitSpeed": launch.get("ExitSpeed"),
+            "LaunchAngle": launch.get("Angle"),
+            "HitDirection": launch.get("Direction"),
+            "HitSpinRate": launch.get("HitSpinRate"),
+            "LandingBearing": landing.get("Bearing"),
+            "LandingDistance": landing.get("Distance"),
+            "HangTime": landing.get("HangTime"),
+            "LandingConfidence": landing.get("Confidence"),
+        })
+    return rows
+
+
+def save_csv(rows, output_file):
+    if not rows:
+        print("沒有找到 Trackman 資料，略過 CSV 輸出")
+        return
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    with output_file.open("w", encoding="utf-8-sig", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"CSV 完成: {output_file.resolve()} ({len(rows)} 筆)")
+
+
+def parse_dates(args):
+    if args.dates:
+        dates = args.dates
+    elif args.start_date and args.end_date:
+        start = date.fromisoformat(args.start_date)
+        end = date.fromisoformat(args.end_date)
+        if start > end:
+            raise ValueError("start-date 不可晚於 end-date")
+        dates = [
+            (start + timedelta(days=offset)).isoformat()
+            for offset in range((end - start).days + 1)
+        ]
+    else:
+        raise ValueError("請使用 --dates，或同時使用 --start-date 和 --end-date")
+    return list(dict.fromkeys(dates))
+
+
+# ============================================================
 # 主程式
 # ============================================================
 
 def main():
-
-    print()
-    print("=" * 60)
-    print("CPBL 2026/09/14 Trackman 測試")
-    print("=" * 60)
-
-    print()
-    print(
-        "目標日期:",
-        TARGET_DATE
+    parser = argparse.ArgumentParser(
+        description="取得 CPBL Trackman 資料並合併輸出 CSV"
     )
-
-    # ========================================================
-    # 1. 取得當天賽程
-    # ========================================================
-
-    schedule_data = fetch_schedule(
-        TARGET_DATE
+    parser.add_argument(
+        "--dates", nargs="+", help="要抓取的日期，例如 2026-09-14 2026-09-15"
     )
-
-    if schedule_data is None:
-        return
-
-    # ========================================================
-    # 2. 找比賽
-    # ========================================================
-
-    games = extract_games(
-        schedule_data
+    parser.add_argument("--start-date", help="連續日期的起始日，格式 YYYY-MM-DD")
+    parser.add_argument("--end-date", help="連續日期的結束日，格式 YYYY-MM-DD")
+    parser.add_argument(
+        "--output", type=Path, default=CSV_OUTPUT, help="CSV 輸出路徑"
     )
+    args = parser.parse_args()
 
-    if not games:
+    try:
+        dates = parse_dates(args)
+    except ValueError as error:
+        parser.error(str(error))
 
-        print()
-        print(
-            "❌ 這一天沒有找到比賽"
-        )
+    all_rows = []
+    downloaded = 0
+    total_games = 0
 
-        return
-
-    # ========================================================
-    # 3. 顯示比賽
-    # ========================================================
-
-    valid_games = show_schedule(
-        games
-    )
-
-    if not valid_games:
-
-        print()
-        print(
-            "❌ 沒有找到有效 Game ID"
-        )
-
-        return
-
-    # ========================================================
-    # 4. 一場一場抓
-    # ========================================================
-
-    success_count = 0
-
-    for game_id, schedule_game in valid_games:
-
-        print()
-        print()
-        print("#" * 60)
-        print(
-            f"開始處理 {game_id}"
-        )
-        print("#" * 60)
-
-        data = fetch_game(
-            game_id
-        )
-
-        if data is None:
-
-            print(
-                f"❌ {game_id} 取得失敗"
-            )
-
+    for target_date in dates:
+        print(f"\n{'=' * 60}\n處理日期: {target_date}\n{'=' * 60}")
+        schedule_data = fetch_schedule(target_date)
+        if schedule_data is None:
             continue
 
-        # ----------------------------------------------------
-        # 儲存
-        # ----------------------------------------------------
+        valid_games = show_schedule(extract_games(schedule_data))
+        total_games += len(valid_games)
+        for game_id, _ in valid_games:
+            data = fetch_game(game_id)
+            if data is None:
+                continue
+            save_game_json(data, game_id)
+            all_rows.extend(convert_game(data))
+            downloaded += 1
 
-        save_game_json(
-            data,
-            game_id
-        )
-
-        # ----------------------------------------------------
-        # 分析
-        # ----------------------------------------------------
-
-        analyze_game(
-            data,
-            game_id
-        )
-
-        success_count += 1
-
-    # ========================================================
-    # 完成
-    # ========================================================
-
-    print()
-    print()
-    print("=" * 60)
-    print("全部完成")
-    print("=" * 60)
-
-    print()
-    print(
-        "成功取得:",
-        success_count,
-        "/",
-        len(valid_games),
-        "場"
-    )
-
-    print()
-    print(
-        "JSON 儲存位置:"
-    )
-
-    print(
-        OUTPUT_DIR.resolve()
-    )
+    save_csv(all_rows, args.output)
+    print(f"完成：日期 {len(dates)} 天，成功取得 {downloaded}/{total_games} 場")
 
 
 # ============================================================
